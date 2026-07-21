@@ -12,7 +12,7 @@ export default async function handler(req, res) {
     return;
   }
 
-  const { prompt } = req.body || {};
+  const { prompt, useSearch } = req.body || {};
   if (!prompt || typeof prompt !== 'string') {
     res.status(400).json({ error: 'Missing "prompt" in request body' });
     return;
@@ -24,6 +24,15 @@ export default async function handler(req, res) {
   }
 
   try {
+    const body = {
+      model: 'claude-sonnet-5',
+      max_tokens: 1000,
+      messages: [{ role: 'user', content: prompt }],
+    };
+    if (useSearch !== false) {
+      body.tools = [{ type: 'web_search_20250305', name: 'web_search', max_uses: 2 }];
+    }
+
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -31,12 +40,7 @@ export default async function handler(req, res) {
         'x-api-key': process.env.ANTHROPIC_API_KEY,
         'anthropic-version': '2023-06-01',
       },
-      body: JSON.stringify({
-        model: 'claude-sonnet-5',
-        max_tokens: 1000,
-        messages: [{ role: 'user', content: prompt }],
-        tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 2 }],
-      }),
+      body: JSON.stringify(body),
     });
 
     if (!response.ok) {
