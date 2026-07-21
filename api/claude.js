@@ -2,6 +2,10 @@
 // Keeps the Anthropic API key on the server; the browser never sees it.
 // Requires an ANTHROPIC_API_KEY environment variable set in the Vercel project settings.
 
+export const config = {
+  maxDuration: 60,
+};
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     res.status(405).json({ error: 'Method not allowed' });
