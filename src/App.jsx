@@ -254,24 +254,31 @@ export default function SPIntelligencePlatform() {
         .map((g) => `"${g.key}":{${g.items.map(([k]) => `"${k}":"..."`).join(",")}}`)
         .join(",");
 
-      const prompt = `你是專門追蹤 FCN（Fixed Coupon Note）與 BEN（Bonus Enhanced Note）結構型商品的市場分析助理，且是一個每日市場資料收集引擎（AI Market Engine）。請使用網路搜尋工具查證今天最新的總體經濟與市場數據，然後只回覆一個 JSON 物件，不要有任何前言、註解或 Markdown 符號，格式如下：
-{"summary":"針對結構型商品投資人的今日總經與市場摘要，繁體中文，80-120字","stance":"偏保守 或 中性 或 偏積極","reasoning":"給出此投資積極度建議的理由，繁體中文，60-100字","alerts":["風險警示1","風險警示2"],"data":{${dataFieldsSpec}}}
+      const prompt = `你是專門追蹤 FCN（Fixed Coupon Note）與 BEN（Bonus Enhanced Note）結構型商品的市場分析助理，且是一個每日市場資料收集引擎（AI Market Engine）。
 
-data 欄位規則：每一項請填最新數值或極簡短狀態描述（不超過12個字，例如「5.25-5.50%不變」「50.2 擴張」「+0.8%」），查不到就填「N/A」，不要展開解釋。
+重要限制：你最多只能使用 2 次網路搜尋（例如一次查總體經濟/利率概況、一次查 VIX 與主要股指），查不到或沒時間查的欄位一律填「N/A」。務必在搜尋完後，把完整的 JSON 答案寫出來——寫出答案比查到更多資料更重要，絕對不要因為一直搜尋而沒有輸出最終 JSON。
+
+只回覆一個 JSON 物件，不要有任何前言、註解或 Markdown 符號，格式如下：
+{"summary":"針對結構型商品投資人的今日總經與市場摘要，繁體中文，60-90字","stance":"偏保守 或 中性 或 偏積極","reasoning":"給出此投資積極度建議的理由，繁體中文，40-70字","alerts":["風險警示1"],"data":{${dataFieldsSpec}}}
+
+data 欄位規則：每一項請填最新數值或極簡短狀態描述（不超過8個字，例如「5.25%不變」「50.2擴張」「+0.8%」），查不到就填「N/A」，不要展開解釋。
 
 背景資訊：
 目前 SP Intelligence Score（0-100，分數越高代表市場與持倉狀況越有利）＝ ${computed.overall}
 六大構面分數：宏觀經濟=${dimScores.macro}、市場波動=${dimScores.volatility}、標的健康度=${dimScores.underlying}、AI新聞情緒=${dimScores.sentiment}、技術面=${dimScores.technical}、持倉風險=${computed.overallScores.holdingRisk}
 目前持倉：${holdingsSummary}
 
-alerts 陣列請針對距離 Knock-In 過近（如小於 10%）或到期集中、標的集中等情況提出具體警示；若無明顯風險可回傳空陣列。`;
+alerts 陣列請針對距離 Knock-In 過近（如小於 10%）或到期集中、標的集中等情況提出具體警示；若無明顯風險可回傳空陣列，最多列出 1-2 項。`;
 
       const text = await callClaude(prompt);
       const parsed = parseJsonLoose(text);
+      if (!parsed && !text) {
+        console.warn("Claude returned no text content — likely ran out of output budget while searching.");
+      }
       const entry = {
         id: uid(),
         timestamp: new Date().toISOString(),
-        summary: parsed?.summary || text || "AI 未回傳有效內容",
+        summary: parsed?.summary || text || "AI 這次搜尋耗時過長，沒能寫出完整答案，請按「強制重新產生」再試一次。",
         stance: parsed?.stance || "中性",
         reasoning: parsed?.reasoning || "",
         alerts: parsed?.alerts || [],
