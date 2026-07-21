@@ -98,11 +98,11 @@ async function storageSet(key, value) {
 
 // Calls our own /api/claude serverless function, which holds the real Anthropic
 // API key server-side (see api/claude.js). The browser never sees the key.
-async function callClaude(promptText) {
+async function callClaude(promptText, useSearch = true) {
   const res = await fetch("/api/claude", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt: promptText }),
+    body: JSON.stringify({ prompt: promptText, useSearch }),
   });
   const data = await res.json();
   if (!res.ok) throw new Error(data?.error || "AI 服務暫時無法使用");
@@ -254,35 +254,51 @@ export default function SPIntelligencePlatform() {
         .map((g) => `"${g.key}":{${g.items.map(([k]) => `"${k}":"..."`).join(",")}}`)
         .join(",");
 
-      const prompt = `你是專門追蹤 FCN（Fixed Coupon Note）與 BEN（Bonus Enhanced Note）結構型商品的市場分析助理，且是一個每日市場資料收集引擎（AI Market Engine）。
+      // Call 1: data collection only — small output, room for up to 2 searches.
+      const dataPrompt = `你是一個每日市場資料收集引擎（AI Market Engine），服務對象是 FCN／BEN 結構型商品投資人。
 
-重要限制：你最多只能使用 2 次網路搜尋（例如一次查總體經濟/利率概況、一次查 VIX 與主要股指），查不到或沒時間查的欄位一律填「N/A」。務必在搜尋完後，把完整的 JSON 答案寫出來——寫出答案比查到更多資料更重要，絕對不要因為一直搜尋而沒有輸出最終 JSON。
+最多使用 2 次網路搜尋（例如一次查總體經濟/利率概況、一次查 VIX 與主要股指），查不到就填「N/A」，不要為了查更多資料而不輸出答案。
 
-只回覆一個 JSON 物件，不要有任何前言、註解或 Markdown 符號，格式如下：
-{"summary":"針對結構型商品投資人的今日總經與市場摘要，繁體中文，60-90字","stance":"偏保守 或 中性 或 偏積極","reasoning":"給出此投資積極度建議的理由，繁體中文，40-70字","alerts":["風險警示1"],"data":{${dataFieldsSpec}}}
+只回覆一個 JSON 物件，不要有任何前言、註解或 Markdown 符號，每個欄位值不超過8個字（例如「5.25%不變」「50.2擴張」「+0.8%」）：
+{${dataFieldsSpec}}`;
 
-data 欄位規則：每一項請填最新數值或極簡短狀態描述（不超過8個字，例如「5.25%不變」「50.2擴張」「+0.8%」），查不到就填「N/A」，不要展開解釋。
+      const dataText = await callClaude(dataPrompt, true);
+      const marketData = parseJsonLoose(dataText);
+      if (!marketData) console.warn("Market data call returned unparseable text:", dataText);
 
-背景資訊：
+      // Call 2: summary / stance / alerts — reasoning only, no search, so it never gets cut off.
+      const dataSummaryForPrompt = marketData
+        ? Object.entries(marketData).map(([g, vals]) => `${g}: ${Object.entries(vals || {}).map(([k, v]) => `${k}=${v}`).join(", ")}`).join("\n")
+        : "（本次未能取得市場數據）";
+
+      const advicePrompt = `你是專門追蹤 FCN（Fixed Coupon Note）與 BEN（Bonus Enhanced Note）結構型商品的市場分析助理。根據下面已經收集好的市場數據與投資組合資訊，直接給出分析，不需要再搜尋。
+
+只回覆一個 JSON 物件，不要有任何前言、註解或 Markdown 符號：
+{"summary":"針對結構型商品投資人的今日總經與市場摘要，繁體中文，60-90字","stance":"偏保守 或 中性 或 偏積極","reasoning":"給出此投資積極度建議的理由，繁體中文，40-70字","alerts":["風險警示（最多1-2項，若無明顯風險回傳空陣列）"]}
+
+今日市場數據：
+${dataSummaryForPrompt}
+
+投資組合背景：
 目前 SP Intelligence Score（0-100，分數越高代表市場與持倉狀況越有利）＝ ${computed.overall}
 六大構面分數：宏觀經濟=${dimScores.macro}、市場波動=${dimScores.volatility}、標的健康度=${dimScores.underlying}、AI新聞情緒=${dimScores.sentiment}、技術面=${dimScores.technical}、持倉風險=${computed.overallScores.holdingRisk}
 目前持倉：${holdingsSummary}
 
-alerts 陣列請針對距離 Knock-In 過近（如小於 10%）或到期集中、標的集中等情況提出具體警示；若無明顯風險可回傳空陣列，最多列出 1-2 項。`;
+alerts 請針對距離 Knock-In 過近（如小於 10%）或到期集中、標的集中等情況提出具體警示。`;
 
-      const text = await callClaude(prompt);
-      const parsed = parseJsonLoose(text);
-      if (!parsed && !text) {
-        console.warn("Claude returned no text content — likely ran out of output budget while searching.");
+      const adviceText = await callClaude(advicePrompt, false);
+      const parsed = parseJsonLoose(adviceText);
+      if (!parsed && !adviceText) {
+        console.warn("Advice call returned no text — likely still ran out of budget.");
       }
       const entry = {
         id: uid(),
         timestamp: new Date().toISOString(),
-        summary: parsed?.summary || text || "AI 這次搜尋耗時過長，沒能寫出完整答案，請按「強制重新產生」再試一次。",
+        summary: parsed?.summary || adviceText || "AI 這次沒能寫出完整答案，請按「強制重新產生」再試一次。",
         stance: parsed?.stance || "中性",
         reasoning: parsed?.reasoning || "",
         alerts: parsed?.alerts || [],
-        data: parsed?.data || null,
+        data: marketData || null,
       };
       persistReports([entry, ...reports].slice(0, 8));
     } catch (e) {
