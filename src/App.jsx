@@ -27,14 +27,18 @@ const DIMENSIONS = [
   { key: "underlying", label: "標的健康度", sub: "趨勢／波動／財報" },
   { key: "sentiment", label: "AI新聞情緒", sub: "新聞情緒分析" },
   { key: "technical", label: "技術面", sub: "均線／RSI／MACD" },
-  { key: "holdingRisk", label: "持倉風險", sub: "距KI／集中度／到期分布" },
+  { key: "holdingRisk", label: "持倉風險", sub: "距KI／集中度／配息與分散度" },
 ];
 
 const DEFAULT_WEIGHTS = {
   BASE: { macro: 25, volatility: 20, underlying: 20, sentiment: 15, technical: 10, holdingRisk: 10 },
   FCN:  { macro: 18, volatility: 30, underlying: 15, sentiment: 12, technical: 7,  holdingRisk: 18 },
   BEN:  { macro: 18, volatility: 14, underlying: 26, sentiment: 12, technical: 20, holdingRisk: 10 },
+  FUND: { macro: 15, volatility: 25, underlying: 15, sentiment: 10, technical: 5,  holdingRisk: 30 },
 };
+
+const TYPE_COLORS = { FCN: "#5B8DEF", BEN: "#C9A227", FUND: "#C084FC" };
+function typeColor(type) { return TYPE_COLORS[type] || "#8B94A6"; }
 
 const DEFAULT_SCORES = { macro: 55, volatility: 50, underlying: 60, sentiment: 55, technical: 50 };
 
@@ -53,6 +57,50 @@ function holdingRiskSubscore(distance) {
   if (distance >= 8) return 50;
   if (distance >= 3) return 25;
   return 10;
+}
+
+// Fund / other holdings don't have a Knock-In barrier — instead we score them on
+// distribution yield sustainability, annualized volatility, and how diversified
+// the underlying allocation is (all manually entered, 0-100 for diversification).
+function fundRiskSubscore(h) {
+  const yieldPct = h.coupon;
+  const vol = h.volatilityPct;
+  const divers = h.diversification;
+
+  let yieldScore = 55;
+  if (yieldPct !== null && yieldPct !== undefined && !isNaN(yieldPct)) {
+    if (yieldPct > 15) yieldScore = 35;
+    else if (yieldPct > 10) yieldScore = 60;
+    else if (yieldPct >= 4) yieldScore = 85;
+    else yieldScore = 55;
+  }
+
+  let volScore = 55;
+  if (vol !== null && vol !== undefined && !isNaN(vol)) {
+    if (vol <= 8) volScore = 90;
+    else if (vol <= 15) volScore = 70;
+    else if (vol <= 25) volScore = 45;
+    else volScore = 20;
+  }
+
+  const diversScore = divers !== null && divers !== undefined && !isNaN(divers) ? Number(divers) : 50;
+
+  return Math.round(yieldScore * 0.35 + volScore * 0.35 + diversScore * 0.3);
+}
+
+function fundRiskZone(score) {
+  if (score >= 75) return { label: "穩健", color: "#4ADE80" };
+  if (score >= 55) return { label: "留意", color: "#FBBF24" };
+  if (score >= 35) return { label: "偏高風險", color: "#F97316" };
+  return { label: "高風險", color: "#F87171" };
+}
+
+// Dispatches to the right risk model depending on holding type.
+function holdingRiskFor(h) {
+  return h.type === "FUND" ? fundRiskSubscore(h) : holdingRiskSubscore(h.kiDistance);
+}
+function riskInfo(h) {
+  return h.type === "FUND" ? fundRiskZone(fundRiskSubscore(h)) : riskZone(h.kiDistance);
 }
 
 function weightedScore(scores, weights) {
@@ -75,6 +123,9 @@ function isToday(isoString) {
   const now = new Date();
   return d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
 }
+
+// Set to true to re-enable the AI daily report feature.
+const AI_REPORTS_ENABLED = false;
 
 const MARKET_DATA_GROUPS = [
   { key: "macro", label: "Macro", items: [["fed", "Fed"], ["ecb", "ECB"], ["boj", "BOJ"], ["boe", "BOE"]] },
@@ -164,23 +215,27 @@ function useComputedScores(holdings, dimScores, weights) {
     const withType = (type) => holdings.filter((h) => h.type === type);
     const avgHoldingRisk = (list) => {
       if (list.length === 0) return 60;
-      const sum = list.reduce((a, h) => a + holdingRiskSubscore(h.kiDistance), 0);
+      const sum = list.reduce((a, h) => a + holdingRiskFor(h), 0);
       return Math.round((sum / list.length) * 10) / 10;
     };
 
     const fcnHoldings = withType("FCN");
     const benHoldings = withType("BEN");
+    const fundHoldings = withType("FUND");
 
     const overallScores = { ...dimScores, holdingRisk: avgHoldingRisk(holdings) };
     const fcnScores = { ...dimScores, holdingRisk: avgHoldingRisk(fcnHoldings) };
     const benScores = { ...dimScores, holdingRisk: avgHoldingRisk(benHoldings) };
+    const fundScores = { ...dimScores, holdingRisk: avgHoldingRisk(fundHoldings) };
 
     return {
       overall: weightedScore(overallScores, weights.BASE),
       fcn: fcnHoldings.length ? weightedScore(fcnScores, weights.FCN) : null,
       ben: benHoldings.length ? weightedScore(benScores, weights.BEN) : null,
+      fund: fundHoldings.length ? weightedScore(fundScores, weights.FUND) : null,
       fcnCount: fcnHoldings.length,
       benCount: benHoldings.length,
+      fundCount: fundHoldings.length,
       overallScores,
     };
   }, [holdings, dimScores, weights]);
@@ -192,7 +247,7 @@ function useComputedScores(holdings, dimScores, weights) {
 
 export default function SPIntelligencePlatform() {
   const [ready, setReady] = useState(false);
-  const [tab, setTab] = useState("dashboard");
+  const [tab, setTab] = useState("holdings");
   const [holdings, setHoldings] = useState([]);
   const [dimScores, setDimScores] = useState(DEFAULT_SCORES);
   const [weights, setWeights] = useState(DEFAULT_WEIGHTS);
@@ -240,6 +295,7 @@ export default function SPIntelligencePlatform() {
   const updateHolding = (id, patch) => persistHoldings(holdings.map((h) => (h.id === id ? { ...h, ...patch } : h)));
 
   const generateReport = async (force = false) => {
+    if (!AI_REPORTS_ENABLED) return;
     if (!force && reports[0] && isToday(reports[0].timestamp)) {
       return; // already generated today — skip the API call to save tokens
     }
@@ -362,10 +418,10 @@ alerts 請針對距離 Knock-In 過近（如小於 10%）或到期集中、標�
 
 function Sidebar({ tab, setTab }) {
   const items = [
-    { key: "dashboard", label: "儀表板", icon: LayoutDashboard },
     { key: "holdings", label: "持倉管理", icon: Briefcase },
     { key: "compare", label: "商品比較", icon: GitCompare },
     { key: "risk", label: "Knock-In 風險", icon: AlertTriangle },
+    { key: "dashboard", label: "儀表板", icon: LayoutDashboard },
     { key: "settings", label: "評分設定", icon: SettingsIcon },
   ];
   return (
@@ -484,101 +540,120 @@ function Dashboard({ computed, dimScores, weights, holdings, band, reports, gene
             </div>
             <Badge color={band.color}>{band.label}</Badge>
           </Panel>
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-3 gap-3">
             <Panel className="p-4">
               <StatLabel>FCN 評分</StatLabel>
-              <div style={{ fontFamily: "Fraunces, serif", fontWeight: 600, fontSize: "1.7rem", color: "#5B8DEF" }}>
+              <div style={{ fontFamily: "Fraunces, serif", fontWeight: 600, fontSize: "1.5rem", color: typeColor("FCN") }}>
                 {computed.fcn ?? "—"}
               </div>
-              <div style={{ color: "#4A5568", fontSize: "0.7rem" }}>{computed.fcnCount} 檔持倉</div>
+              <div style={{ color: "#4A5568", fontSize: "0.68rem" }}>{computed.fcnCount} 檔</div>
             </Panel>
             <Panel className="p-4">
               <StatLabel>BEN 評分</StatLabel>
-              <div style={{ fontFamily: "Fraunces, serif", fontWeight: 600, fontSize: "1.7rem", color: "#C9A227" }}>
+              <div style={{ fontFamily: "Fraunces, serif", fontWeight: 600, fontSize: "1.5rem", color: typeColor("BEN") }}>
                 {computed.ben ?? "—"}
               </div>
-              <div style={{ color: "#4A5568", fontSize: "0.7rem" }}>{computed.benCount} 檔持倉</div>
+              <div style={{ color: "#4A5568", fontSize: "0.68rem" }}>{computed.benCount} 檔</div>
+            </Panel>
+            <Panel className="p-4">
+              <StatLabel>基金／其他</StatLabel>
+              <div style={{ fontFamily: "Fraunces, serif", fontWeight: 600, fontSize: "1.5rem", color: typeColor("FUND") }}>
+                {computed.fund ?? "—"}
+              </div>
+              <div style={{ color: "#4A5568", fontSize: "0.68rem" }}>{computed.fundCount} 檔</div>
             </Panel>
           </div>
         </div>
       </div>
 
-      <Panel className="p-5">
-        <div className="flex items-center justify-between mb-3">
-          <div className="flex items-center gap-2">
-            <Sparkles size={16} style={{ color: "#C9A227" }} />
-            <span style={{ color: "#ECEFF3", fontWeight: 600, fontSize: "0.9rem" }}>AI 每日市場摘要與投資建議</span>
-          </div>
-          <div className="flex items-center gap-3">
-            {generatedToday && !aiLoading && (
-              <button onClick={() => generateReport(true)} className="text-xs underline" style={{ color: "#8B94A6" }}>
-                強制重新產生
-              </button>
-            )}
-            <button
-              onClick={() => generateReport(false)}
-              disabled={aiLoading || generatedToday}
-              className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-opacity"
-              style={{ backgroundColor: "#C9A227", color: "#0A0E14", opacity: aiLoading || generatedToday ? 0.55 : 1 }}
-            >
-              {aiLoading ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />}
-              {aiLoading ? "分析中…" : generatedToday ? "今日已產生" : "產生今日報告"}
-            </button>
-          </div>
-        </div>
-
-        {aiError && <div className="text-sm mb-3" style={{ color: "#F87171" }}>{aiError}</div>}
-
-        {latestReport ? (
-          <div className="space-y-3">
+      {AI_REPORTS_ENABLED ? (
+        <Panel className="p-5">
+          <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-2">
-              <Badge color={latestReport.stance === "偏積極" ? "#4ADE80" : latestReport.stance === "偏保守" ? "#F87171" : "#FBBF24"}>
-                {latestReport.stance}
-              </Badge>
-              <span style={{ color: "#4A5568", fontSize: "0.7rem" }}>
-                {new Date(latestReport.timestamp).toLocaleString("zh-TW")}
-              </span>
+              <Sparkles size={16} style={{ color: "#C9A227" }} />
+              <span style={{ color: "#ECEFF3", fontWeight: 600, fontSize: "0.9rem" }}>AI 每日市場摘要與投資建議</span>
             </div>
-            <p style={{ color: "#ECEFF3", fontSize: "0.88rem", lineHeight: 1.6 }}>{latestReport.summary}</p>
-            {latestReport.reasoning && (
-              <p style={{ color: "#8B94A6", fontSize: "0.82rem", lineHeight: 1.6 }}>建議理由：{latestReport.reasoning}</p>
-            )}
-            {latestReport.alerts?.length > 0 && (
-              <div className="space-y-1 pt-1">
-                {latestReport.alerts.map((a, i) => (
-                  <div key={i} className="flex items-start gap-2 text-sm" style={{ color: "#FBBF24" }}>
-                    <AlertTriangle size={14} className="mt-0.5 shrink-0" />
-                    <span>{a}</span>
-                  </div>
-                ))}
+            <div className="flex items-center gap-3">
+              {generatedToday && !aiLoading && (
+                <button onClick={() => generateReport(true)} className="text-xs underline" style={{ color: "#8B94A6" }}>
+                  強制重新產生
+                </button>
+              )}
+              <button
+                onClick={() => generateReport(false)}
+                disabled={aiLoading || generatedToday}
+                className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-opacity"
+                style={{ backgroundColor: "#C9A227", color: "#0A0E14", opacity: aiLoading || generatedToday ? 0.55 : 1 }}
+              >
+                {aiLoading ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />}
+                {aiLoading ? "分析中…" : generatedToday ? "今日已產生" : "產生今日報告"}
+              </button>
+            </div>
+          </div>
+
+          {aiError && <div className="text-sm mb-3" style={{ color: "#F87171" }}>{aiError}</div>}
+
+          {latestReport ? (
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <Badge color={latestReport.stance === "偏積極" ? "#4ADE80" : latestReport.stance === "偏保守" ? "#F87171" : "#FBBF24"}>
+                  {latestReport.stance}
+                </Badge>
+                <span style={{ color: "#4A5568", fontSize: "0.7rem" }}>
+                  {new Date(latestReport.timestamp).toLocaleString("zh-TW")}
+                </span>
               </div>
-            )}
-            {latestReport.data && (
-              <div className="grid grid-cols-2 md:grid-cols-5 gap-2 pt-2">
-                {MARKET_DATA_GROUPS.map((g) => (
-                  <div key={g.key} className="rounded-lg p-2.5" style={{ backgroundColor: "#1B222E" }}>
-                    <div style={{ color: "#C9A227", fontSize: "0.68rem", fontWeight: 600, marginBottom: "0.35rem" }}>{g.label}</div>
-                    <div className="space-y-1">
-                      {g.items.map(([key, label]) => (
-                        <div key={key} className="flex items-center justify-between gap-2">
-                          <span style={{ color: "#8B94A6", fontSize: "0.62rem" }}>{label}</span>
-                          <span style={{ color: "#ECEFF3", fontSize: "0.62rem", fontFamily: "JetBrains Mono, monospace", textAlign: "right" }}>
-                            {latestReport.data?.[g.key]?.[key] ?? "N/A"}
-                          </span>
-                        </div>
-                      ))}
+              <p style={{ color: "#ECEFF3", fontSize: "0.88rem", lineHeight: 1.6 }}>{latestReport.summary}</p>
+              {latestReport.reasoning && (
+                <p style={{ color: "#8B94A6", fontSize: "0.82rem", lineHeight: 1.6 }}>建議理由：{latestReport.reasoning}</p>
+              )}
+              {latestReport.alerts?.length > 0 && (
+                <div className="space-y-1 pt-1">
+                  {latestReport.alerts.map((a, i) => (
+                    <div key={i} className="flex items-start gap-2 text-sm" style={{ color: "#FBBF24" }}>
+                      <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+                      <span>{a}</span>
                     </div>
-                  </div>
-                ))}
-              </div>
-            )}
+                  ))}
+                </div>
+              )}
+              {latestReport.data && (
+                <div className="grid grid-cols-2 md:grid-cols-5 gap-2 pt-2">
+                  {MARKET_DATA_GROUPS.map((g) => (
+                    <div key={g.key} className="rounded-lg p-2.5" style={{ backgroundColor: "#1B222E" }}>
+                      <div style={{ color: "#C9A227", fontSize: "0.68rem", fontWeight: 600, marginBottom: "0.35rem" }}>{g.label}</div>
+                      <div className="space-y-1">
+                        {g.items.map(([key, label]) => (
+                          <div key={key} className="flex items-center justify-between gap-2">
+                            <span style={{ color: "#8B94A6", fontSize: "0.62rem" }}>{label}</span>
+                            <span style={{ color: "#ECEFF3", fontSize: "0.62rem", fontFamily: "JetBrains Mono, monospace", textAlign: "right" }}>
+                              {latestReport.data?.[g.key]?.[key] ?? "N/A"}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : (
+            <div style={{ color: "#4A5568", fontSize: "0.85rem" }}>
+              尚未產生報告。按下「產生今日報告」，AI 會搜尋最新總經與市場狀況，並依你目前的分數與持倉給出摘要與投資積極度建議。同一天內只會產生一次，節省 Token。
+            </div>
+          )}
+        </Panel>
+      ) : (
+        <Panel className="p-5">
+          <div className="flex items-center gap-2">
+            <Sparkles size={16} style={{ color: "#4A5568" }} />
+            <span style={{ color: "#8B94A6", fontWeight: 600, fontSize: "0.9rem" }}>AI 每日市場摘要與投資建議（已暫時關閉）</span>
           </div>
-        ) : (
-          <div style={{ color: "#4A5568", fontSize: "0.85rem" }}>
-            尚未產生報告。按下「產生今日報告」，AI 會搜尋最新總經與市場狀況，並依你目前的分數與持倉給出摘要與投資積極度建議。同一天內只會產生一次，節省 Token。
+          <div style={{ color: "#4A5568", fontSize: "0.8rem", marginTop: "0.5rem" }}>
+            目前平台專注於持倉管理，AI 報告功能已暫停以節省 API 額度。需要時可以再請人打開。
           </div>
-        )}
-      </Panel>
+        </Panel>
+      )}
     </div>
   );
 }
@@ -588,7 +663,7 @@ function Dashboard({ computed, dimScores, weights, holdings, band, reports, gene
 ------------------------------------------------------------------*/
 
 function emptyForm() {
-  return { name: "", type: "FCN", underlyings: "", coupon: "", issueDate: "", maturityDate: "", notional: "", kiDistance: "" };
+  return { name: "", type: "FCN", underlyings: "", coupon: "", issueDate: "", maturityDate: "", notional: "", kiDistance: "", volatilityPct: "", diversification: "" };
 }
 
 function HoldingsView({ holdings, addHolding, removeHolding, updateHolding }) {
@@ -613,6 +688,8 @@ function HoldingsView({ holdings, addHolding, removeHolding, updateHolding }) {
       maturityDate: h.maturityDate ?? "",
       notional: h.notional ?? "",
       kiDistance: h.kiDistance ?? "",
+      volatilityPct: h.volatilityPct ?? "",
+      diversification: h.diversification ?? "",
     });
     setShowForm(true);
   };
@@ -630,6 +707,8 @@ function HoldingsView({ holdings, addHolding, removeHolding, updateHolding }) {
       coupon: form.coupon === "" ? null : Number(form.coupon),
       notional: form.notional === "" ? null : Number(form.notional),
       kiDistance: form.kiDistance === "" ? null : Number(form.kiDistance),
+      volatilityPct: form.volatilityPct === "" ? null : Number(form.volatilityPct),
+      diversification: form.diversification === "" ? null : Number(form.diversification),
     };
     if (editingId) {
       updateHolding(editingId, payload);
@@ -669,26 +748,38 @@ function HoldingsView({ holdings, addHolding, removeHolding, updateHolding }) {
               <select value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value })} style={inputStyle}>
                 <option value="FCN">FCN</option>
                 <option value="BEN">BEN</option>
+                <option value="FUND">基金／其他</option>
               </select>
             </Field>
             <Field label="標的（逗號分隔）">
               <input value={form.underlyings} onChange={(e) => setForm({ ...form, underlyings: e.target.value })} style={inputStyle} placeholder="例：AAPL, TSM" />
             </Field>
-            <Field label="票面利率 %">
+            <Field label={form.type === "FUND" ? "年化配息率 %" : "票面利率 %"}>
               <input type="number" value={form.coupon} onChange={(e) => setForm({ ...form, coupon: e.target.value })} style={inputStyle} placeholder="12" />
             </Field>
             <Field label="發行日">
               <input type="date" value={form.issueDate} onChange={(e) => setForm({ ...form, issueDate: e.target.value })} style={inputStyle} />
             </Field>
-            <Field label="到期日">
+            <Field label={form.type === "FUND" ? "到期日（開放式基金可留空）" : "到期日"}>
               <input type="date" value={form.maturityDate} onChange={(e) => setForm({ ...form, maturityDate: e.target.value })} style={inputStyle} />
             </Field>
-            <Field label="名目本金">
+            <Field label="名目本金／投入金額">
               <input type="number" value={form.notional} onChange={(e) => setForm({ ...form, notional: e.target.value })} style={inputStyle} placeholder="100000" />
             </Field>
-            <Field label="目前距離 KI（%）">
-              <input type="number" value={form.kiDistance} onChange={(e) => setForm({ ...form, kiDistance: e.target.value })} style={inputStyle} placeholder="例：18" />
-            </Field>
+            {form.type === "FUND" ? (
+              <>
+                <Field label="年化波動度 %">
+                  <input type="number" value={form.volatilityPct} onChange={(e) => setForm({ ...form, volatilityPct: e.target.value })} style={inputStyle} placeholder="例：12" />
+                </Field>
+                <Field label="資產配置分散度（0集中—100高度分散）">
+                  <input type="number" min={0} max={100} value={form.diversification} onChange={(e) => setForm({ ...form, diversification: e.target.value })} style={inputStyle} placeholder="例：70" />
+                </Field>
+              </>
+            ) : (
+              <Field label="目前距離 KI（%）">
+                <input type="number" value={form.kiDistance} onChange={(e) => setForm({ ...form, kiDistance: e.target.value })} style={inputStyle} placeholder="例：18" />
+              </Field>
+            )}
           </div>
           <div className="flex gap-2 mt-4">
             <button onClick={submit} className="px-4 py-2 rounded-lg text-sm font-medium" style={{ backgroundColor: "#C9A227", color: "#0A0E14" }}>
@@ -711,14 +802,14 @@ function HoldingsView({ holdings, addHolding, removeHolding, updateHolding }) {
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
         {holdings.map((h) => {
-          const zone = riskZone(h.kiDistance);
+          const zone = riskInfo(h);
           return (
             <Panel key={h.id} className="p-4">
               <div className="flex items-start justify-between">
                 <div>
                   <div className="flex items-center gap-2">
                     <span style={{ color: "#ECEFF3", fontWeight: 600, fontSize: "0.9rem" }}>{h.name}</span>
-                    <Badge color={h.type === "FCN" ? "#5B8DEF" : "#C9A227"}>{h.type}</Badge>
+                    <Badge color={typeColor(h.type)}>{h.type === "FUND" ? "基金/其他" : h.type}</Badge>
                   </div>
                   <div style={{ color: "#8B94A6", fontSize: "0.75rem" }} className="mt-1">{h.underlyings || "—"}</div>
                 </div>
@@ -731,11 +822,19 @@ function HoldingsView({ holdings, addHolding, removeHolding, updateHolding }) {
                   </button>
                 </div>
               </div>
-              <div className="grid grid-cols-3 gap-2 mt-3">
-                <MiniStat label="票面利率" value={h.coupon !== null && h.coupon !== undefined ? `${h.coupon}%` : "—"} />
-                <MiniStat label="到期日" value={h.maturityDate || "—"} />
-                <MiniStat label="距KI" value={h.kiDistance !== null && h.kiDistance !== undefined ? `${h.kiDistance}%` : "—"} color={zone.color} />
-              </div>
+              {h.type === "FUND" ? (
+                <div className="grid grid-cols-3 gap-2 mt-3">
+                  <MiniStat label="年化配息率" value={h.coupon !== null && h.coupon !== undefined ? `${h.coupon}%` : "—"} />
+                  <MiniStat label="年化波動度" value={h.volatilityPct !== null && h.volatilityPct !== undefined ? `${h.volatilityPct}%` : "—"} />
+                  <MiniStat label="分散度" value={h.diversification !== null && h.diversification !== undefined ? h.diversification : "—"} />
+                </div>
+              ) : (
+                <div className="grid grid-cols-3 gap-2 mt-3">
+                  <MiniStat label="票面利率" value={h.coupon !== null && h.coupon !== undefined ? `${h.coupon}%` : "—"} />
+                  <MiniStat label="到期日" value={h.maturityDate || "—"} />
+                  <MiniStat label="距KI" value={h.kiDistance !== null && h.kiDistance !== undefined ? `${h.kiDistance}%` : "—"} color={zone.color} />
+                </div>
+              )}
               <div className="mt-2">
                 <Badge color={zone.color}>{zone.label}</Badge>
               </div>
@@ -790,9 +889,9 @@ function CompareView({ holdings, weights, dimScores }) {
   }
   const rows = holdings.map((h) => {
     const w = weights[h.type] || weights.BASE;
-    const scores = { ...dimScores, holdingRisk: holdingRiskSubscore(h.kiDistance) };
+    const scores = { ...dimScores, holdingRisk: holdingRiskFor(h) };
     const score = weightedScore(scores, w);
-    return { ...h, score, zone: riskZone(h.kiDistance) };
+    return { ...h, score, zone: riskInfo(h) };
   });
 
   return (
@@ -804,9 +903,9 @@ function CompareView({ holdings, weights, dimScores }) {
             <th className="pb-2 pr-3">商品</th>
             <th className="pb-2 pr-3">型態</th>
             <th className="pb-2 pr-3">標的</th>
-            <th className="pb-2 pr-3">票面利率</th>
+            <th className="pb-2 pr-3">利率／配息率</th>
             <th className="pb-2 pr-3">到期日</th>
-            <th className="pb-2 pr-3">距KI</th>
+            <th className="pb-2 pr-3">距KI／分散度</th>
             <th className="pb-2 pr-3">SP 子分數</th>
             <th className="pb-2 pr-3">風險燈號</th>
           </tr>
@@ -815,14 +914,16 @@ function CompareView({ holdings, weights, dimScores }) {
           {rows.map((r) => (
             <tr key={r.id} style={{ borderTop: "1px solid #262F3D" }}>
               <td className="py-2 pr-3" style={{ color: "#ECEFF3" }}>{r.name}</td>
-              <td className="py-2 pr-3"><Badge color={r.type === "FCN" ? "#5B8DEF" : "#C9A227"}>{r.type}</Badge></td>
+              <td className="py-2 pr-3"><Badge color={typeColor(r.type)}>{r.type === "FUND" ? "基金/其他" : r.type}</Badge></td>
               <td className="py-2 pr-3" style={{ color: "#8B94A6" }}>{r.underlyings || "—"}</td>
               <td className="py-2 pr-3" style={{ color: "#ECEFF3", fontFamily: "JetBrains Mono, monospace" }}>
                 {r.coupon !== null && r.coupon !== undefined ? `${r.coupon}%` : "—"}
               </td>
-              <td className="py-2 pr-3" style={{ color: "#8B94A6" }}>{r.maturityDate || "—"}</td>
+              <td className="py-2 pr-3" style={{ color: "#8B94A6" }}>{r.maturityDate || (r.type === "FUND" ? "開放式" : "—")}</td>
               <td className="py-2 pr-3" style={{ color: "#ECEFF3", fontFamily: "JetBrains Mono, monospace" }}>
-                {r.kiDistance !== null && r.kiDistance !== undefined ? `${r.kiDistance}%` : "—"}
+                {r.type === "FUND"
+                  ? (r.diversification !== null && r.diversification !== undefined ? r.diversification : "—")
+                  : (r.kiDistance !== null && r.kiDistance !== undefined ? `${r.kiDistance}%` : "—")}
               </td>
               <td className="py-2 pr-3" style={{ color: "#C9A227", fontFamily: "JetBrains Mono, monospace", fontWeight: 600 }}>{r.score}</td>
               <td className="py-2 pr-3"><Badge color={r.zone.color}>{r.zone.label}</Badge></td>
@@ -839,10 +940,19 @@ function CompareView({ holdings, weights, dimScores }) {
 ------------------------------------------------------------------*/
 
 function RiskView({ holdings }) {
-  const chartData = holdings.map((h) => ({
+  const structured = holdings.filter((h) => h.type !== "FUND");
+  const funds = holdings.filter((h) => h.type === "FUND");
+
+  const chartData = structured.map((h) => ({
     name: h.name.length > 10 ? h.name.slice(0, 10) + "…" : h.name,
     distance: h.kiDistance ?? 0,
     color: riskZone(h.kiDistance).color,
+  }));
+
+  const fundChartData = funds.map((h) => ({
+    name: h.name.length > 10 ? h.name.slice(0, 10) + "…" : h.name,
+    score: fundRiskSubscore(h),
+    color: fundRiskZone(fundRiskSubscore(h)).color,
   }));
 
   const underlyingCounts = {};
@@ -863,31 +973,55 @@ function RiskView({ holdings }) {
 
   return (
     <div className="space-y-4">
-      <Panel className="p-5">
-        <div style={{ color: "#ECEFF3", fontWeight: 600, marginBottom: "0.75rem" }}>各持倉距離 Knock-In 百分比</div>
-        <div className="h-64">
-          <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={chartData}>
-              <CartesianGrid stroke="#1B222E" vertical={false} />
-              <XAxis dataKey="name" tick={{ fill: "#8B94A6", fontSize: 10 }} />
-              <YAxis tick={{ fill: "#8B94A6", fontSize: 10 }} />
-              <Tooltip contentStyle={{ backgroundColor: "#1B222E", border: "1px solid #262F3D", color: "#ECEFF3" }} />
-              <Bar dataKey="distance" radius={[4, 4, 0, 0]}>
-                {chartData.map((d, i) => <Cell key={i} fill={d.color} />)}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
-        <div className="flex gap-4 mt-3 text-xs" style={{ color: "#8B94A6" }}>
-          <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full inline-block" style={{ backgroundColor: "#4ADE80" }} />≥25% 安全</span>
-          <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full inline-block" style={{ backgroundColor: "#FBBF24" }} />15-25% 留意</span>
-          <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full inline-block" style={{ backgroundColor: "#F97316" }} />8-15% 警戒</span>
-          <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full inline-block" style={{ backgroundColor: "#F87171" }} />&lt;8% 危險</span>
-        </div>
-      </Panel>
+      {structured.length > 0 && (
+        <Panel className="p-5">
+          <div style={{ color: "#ECEFF3", fontWeight: 600, marginBottom: "0.75rem" }}>各持倉距離 Knock-In 百分比</div>
+          <div className="h-64">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={chartData}>
+                <CartesianGrid stroke="#1B222E" vertical={false} />
+                <XAxis dataKey="name" tick={{ fill: "#8B94A6", fontSize: 10 }} />
+                <YAxis tick={{ fill: "#8B94A6", fontSize: 10 }} />
+                <Tooltip contentStyle={{ backgroundColor: "#1B222E", border: "1px solid #262F3D", color: "#ECEFF3" }} />
+                <Bar dataKey="distance" radius={[4, 4, 0, 0]}>
+                  {chartData.map((d, i) => <Cell key={i} fill={d.color} />)}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="flex gap-4 mt-3 text-xs" style={{ color: "#8B94A6" }}>
+            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full inline-block" style={{ backgroundColor: "#4ADE80" }} />≥25% 安全</span>
+            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full inline-block" style={{ backgroundColor: "#FBBF24" }} />15-25% 留意</span>
+            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full inline-block" style={{ backgroundColor: "#F97316" }} />8-15% 警戒</span>
+            <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full inline-block" style={{ backgroundColor: "#F87171" }} />&lt;8% 危險</span>
+          </div>
+        </Panel>
+      )}
+
+      {funds.length > 0 && (
+        <Panel className="p-5">
+          <div style={{ color: "#ECEFF3", fontWeight: 600, marginBottom: "0.75rem" }}>基金／其他 風險綜合分數</div>
+          <div style={{ color: "#8B94A6", fontSize: "0.75rem", marginBottom: "0.75rem" }}>
+            綜合配息率、年化波動度、資產配置分散度計算，分數越高代表越穩健。
+          </div>
+          <div className="h-56">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={fundChartData}>
+                <CartesianGrid stroke="#1B222E" vertical={false} />
+                <XAxis dataKey="name" tick={{ fill: "#8B94A6", fontSize: 10 }} />
+                <YAxis tick={{ fill: "#8B94A6", fontSize: 10 }} domain={[0, 100]} />
+                <Tooltip contentStyle={{ backgroundColor: "#1B222E", border: "1px solid #262F3D", color: "#ECEFF3" }} />
+                <Bar dataKey="score" radius={[4, 4, 0, 0]}>
+                  {fundChartData.map((d, i) => <Cell key={i} fill={d.color} />)}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        </Panel>
+      )}
 
       <Panel className="p-5">
-        <div style={{ color: "#ECEFF3", fontWeight: 600, marginBottom: "0.5rem" }}>Worst-of 標的集中度</div>
+        <div style={{ color: "#ECEFF3", fontWeight: 600, marginBottom: "0.5rem" }}>Worst-of／持股標的集中度</div>
         {concentrated.length === 0 ? (
           <div style={{ color: "#4ADE80", fontSize: "0.85rem" }}>目前沒有標的重複出現在多筆持倉中，集中度風險低。</div>
         ) : (
@@ -957,11 +1091,11 @@ function SettingsView({ dimScores, persistScores, weights, persistWeights }) {
         </button>
       </Panel>
 
-      {["BASE", "FCN", "BEN"].map((type) => (
+      {["BASE", "FCN", "BEN", "FUND"].map((type) => (
         <Panel key={type} className="p-5">
           <button className="w-full flex items-center justify-between" onClick={() => setEditType(editType === type ? null : type)}>
             <span style={{ color: "#ECEFF3", fontWeight: 600 }}>
-              {type === "BASE" ? "整體組合權重" : `${type} 專屬權重`}
+              {type === "BASE" ? "整體組合權重" : type === "FUND" ? "基金／其他 專屬權重" : `${type} 專屬權重`}
             </span>
             {editType === type ? <ChevronUp size={16} style={{ color: "#8B94A6" }} /> : <ChevronDown size={16} style={{ color: "#8B94A6" }} />}
           </button>
